@@ -102,20 +102,14 @@ https://mobile.element.io/?hs_url=https://example.ru
 ```
 
 ---
-
-## 📱 Recommended Mobile Clients / Рекомендуемые мобильные клиенты
-
-**ENG:** Matrix clients handle WebRTC differently. For the most stable audio and video calls on a self-hosted node, we recommend using clients built on the established legacy SDKs.  
-**RU:** Клиенты Matrix по-разному работают с WebRTC. Для максимальной стабильности аудио- и видеозвонков на собственном сервере лучше использовать приложения, построенные на проверенных стабильных SDK.
-
 ### iOS: Element Classic
 *RU: Используйте диплинк из раздела выше для быстрого входа в один клик.*  
 [![Element on App Store](https://img.shields.io/badge/App_Store-Element_Classic-000000?style=for-the-badge&logo=apple&logoColor=white)](https://apps.apple.com/app/element-messenger/id1083446067)  
-🔗 **App Store:** `[https://apps.apple.com/app/element-messenger/id1083446067](https://apps.apple.com/app/element-messenger/id1083446067)`
+🔗 **App Store:** `https://apps.apple.com/app/element-messenger/id1083446067`
 
 ### Android: SchildiChat
 *RU: Диплинк не нужен. При запуске просто выберите «Custom Server» (Свой сервер) и введите адрес вашего узла.*  
 [![SchildiChat on Google Play](https://img.shields.io/badge/Google_Play-SchildiChat-009A61?style=for-the-badge&logo=google-play&logoColor=white)](https://play.google.com/store/apps/details?id=de.spiritcroc.riotx)  
 [![SchildiChat on F-Droid](https://img.shields.io/badge/F--Droid-SchildiChat-19407C?style=for-the-badge&logo=f-droid&logoColor=white)](https://f-droid.org/packages/de.spiritcroc.riotx/)  
-🔗 **Google Play:** `[https://play.google.com/store/apps/details?id=de.spiritcroc.riotx](https://play.google.com/store/apps/details?id=de.spiritcroc.riotx)`  
-🔗 **F-Droid:** `[https://f-droid.org/packages/de.spiritcroc.riotx/](https://f-droid.org/packages/de.spiritcroc.riotx/)`
+🔗 **Google Play:** `https://play.google.com/store/apps/details?id=de.spiritcroc.riotx`  
+🔗 **F-Droid:** `https://f-droid.org/packages/de.spiritcroc.riotx/`
