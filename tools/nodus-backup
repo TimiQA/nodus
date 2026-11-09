@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# =====================================================================
+#  nodus-backup — полный бэкап сервера nodus
+#   - конфиги и ключи: /opt/nodus, /opt/nodus-rtc, Let's Encrypt, UFW, SSH, cron
+#   - твои личные пути — из /etc/nodus/backup-paths.conf (см. ниже)
+#   - данные всех контейнеров (находит сам по docker mounts)
+#   - база Матрикса: Tuwunel стоп ТОЛЬКО на время копирования, потом сразу старт
+#   - опись системы (версии образов, порты, правила)
+#  Результат: /root/backups/nodus-backup-<host>-<дата>.tar (+ .sha256). Хранит последние $KEEP (3).
+#  ВНУТРИ СЕКРЕТЫ (ключи, сертификаты, токены) — держать только у себя.
+#
+#  /etc/nodus/backup-paths.conf — по строке на путь (относительно /), например:
+#      etc/xray
+#      usr/local/sbin/my-script
+#      inside my-container:/opt/data      ← скопировать папку изнутри контейнера
+#  Восстановление на новом сервере: setup.sh → «Восстановить из бэкапа».
+# =====================================================================
+set -Eeuo pipefail
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+NODUS_LIB="$(cd "$(dirname "$_self")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+[ -f "$NODUS_LIB/lib/common.sh" ] && . "$NODUS_LIB/lib/common.sh"
+
+R="${BK_ROOT:-/}"                       # корень (для тестов)
+OUT="${BK_OUT:-/root/backups}"; KEEP="${KEEP:-3}"
+EXTRA_CONF="${EXTRA_CONF:-/etc/nodus/backup-paths.conf}"
+MATRIX=matrix-conduit; MVOL=nodus_conduit-db
+TS=$(date +%F_%H%M); HOST=$(hostname -s)
+say() { printf '\033[1;36m[backup]\033[0m %s\n' "$*"; }
+bdie() { printf '\033[1;31m[backup] %s\033[0m\n' "$*"; exit 1; }
+[[ $EUID -eq 0 || -n "${BK_ROOT:-}" ]] || bdie "запускай от root"
+
+mkdir -p "$OUT"; chmod 700 "$OUT"
+W=$(mktemp -d "$OUT/.work.XXXX")
+STOPPED=0
+cleanup() {
+  if [[ $STOPPED == 1 ]]; then say "поднимаю Матрикс обратно"; docker start "$MATRIX" >/dev/null 2>&1 || true; fi
+  rm -rf "$W"
+}
+trap cleanup EXIT
+trap 'bdie "ошибка: строка $LINENO: $BASH_COMMAND"' ERR
+
+HAS_DOCKER=0; command -v docker >/dev/null && docker info >/dev/null 2>&1 && HAS_DOCKER=1
+VOL=""
+if [[ $HAS_DOCKER == 1 ]] && docker volume inspect "$MVOL" >/dev/null 2>&1; then
+  VOL=$(docker volume inspect "$MVOL" -f '{{.Mountpoint}}')
+fi
+
+# ---------- место на диске ----------
+DB=0; [[ -n "$VOL" ]] && DB=$(du -sb "$VOL" | cut -f1)
+FREE=$(df -B1 --output=avail "$OUT" | tail -n 1)
+NEED=$(( DB * 2 + 300 * 1024 * 1024 ))
+say "сервер: $HOST | база Матрикса+медиа: $(( DB / 1048576 )) МБ | свободно: $(( FREE / 1048576 )) МБ"
+(( FREE > NEED )) || bdie "мало места: нужно ~$(( NEED / 1048576 )) МБ. Удали старые бэкапы (nodus → «удалить бэкапы»)"
+
+# ---------- 1. конфиги и ключи ----------
+say "1/5 конфиги и ключи"
+paths=(opt/nodus opt/nodus-rtc etc/nodus usr/local/lib/nodus etc/letsencrypt etc/ufw etc/cron.d etc/sysctl.d
+       etc/docker/daemon.json etc/fstab etc/ssh/sshd_config etc/ssh/sshd_config.d root/.ssh/authorized_keys)
+inside=()
+if [[ -f "$R/${EXTRA_CONF#/}" || -f "$EXTRA_CONF" ]]; then
+  conf="$EXTRA_CONF"; [[ -f "$R/${EXTRA_CONF#/}" ]] && conf="$R/${EXTRA_CONF#/}"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"; line="$(echo "$line" | xargs 2>/dev/null || true)"
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == inside\ * ]]; then inside+=("${line#inside }"); continue; fi
+    line="${line#/}"
+    [[ "$line" != *..* ]] || { say "   пропускаю странный путь: $line"; continue; }
+    paths+=("$line")
+  done < "$conf"
+fi
+have=()
+for p in "${paths[@]}"; do [[ -e "$R/$p" ]] && have+=("$p"); done
+if ((${#have[@]})); then
+  tar -C "$R" -czf "$W/configs.tar.gz" "${have[@]}"
+  printf '%s\n' "${have[@]}" >"$W/configs-list.txt"
+  say "   взято: ${#have[@]} путей"
+fi
+
+# ---------- 2. данные контейнеров ----------
+if [[ $HAS_DOCKER == 1 ]]; then
+  say "2/5 данные контейнеров"
+  : >"$W/container-mounts.txt"; : >"$W/.mpaths"
+  for c in $(docker ps -a --format '{{.Names}}'); do
+    while IFS='|' read -r t s d; do
+      [[ -n "$s" && -e "$s" ]] || continue
+      case "$s" in
+        "$VOL"|/var/run/docker.sock|/etc/letsencrypt*|/opt/nodus/*|/opt/nodus-rtc/*|/proc*|/sys*|/dev*|/lib/modules*) continue ;;
+      esac
+      sz=$(du -sb "$s" 2>/dev/null | cut -f1 || echo 0)
+      if (( sz > 2147483648 )); then
+        echo "$c: $s ПРОПУЩЕН, слишком большой ($(( sz / 1048576 )) МБ)" >>"$W/container-mounts.txt"; continue
+      fi
+      echo "$c: $t $s -> $d ($(( sz / 1024 )) КБ)" >>"$W/container-mounts.txt"
+      echo "${s#/}" >>"$W/.mpaths"
+    done < <(docker inspect -f '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' "$c")
+  done
+  if [[ -s "$W/.mpaths" ]]; then
+    sort -u "$W/.mpaths" | tar -C / -czf "$W/container-data.tar.gz" -T -
+  fi
+  rm -f "$W/.mpaths"
+  # данные, которые контейнеры держат внутри себя (из backup-paths.conf: inside <контейнер>:<путь>)
+  mkdir -p "$W/inside"
+  for spec in "${inside[@]}"; do
+    c="${spec%%:*}"; p="${spec#*:}"
+    docker inspect "$c" >/dev/null 2>&1 || continue
+    if docker exec "$c" test -d "$p" 2>/dev/null; then
+      docker cp "$c:$p" "$W/inside/$c-$(echo "$p" | tr '/' '-' | sed 's/^-//')" >/dev/null 2>&1 \
+        && echo "$c: $p (изнутри контейнера)" >>"$W/container-mounts.txt" || true
+    fi
+  done
+  if [[ -n "$(ls -A "$W/inside")" ]]; then tar -C "$W/inside" -czf "$W/container-inside.tar.gz" .; fi
+  rm -rf "$W/inside"
+  sed 's/^/   /' "$W/container-mounts.txt"
+else
+  say "2/5 docker нет — пропускаю"
+fi
+
+# ---------- 3. опись системы ----------
+say "3/5 опись системы"
+{
+  echo "== $HOST $(date)"; uname -a; grep PRETTY /etc/os-release
+  echo; echo "== docker ps"; docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+  echo; echo "== images"; docker images --digests
+  echo; echo "== ufw"; ufw status numbered
+  echo; echo "== ports"; ss -lntup
+  echo; echo "== services"; systemctl list-units --type=service --state=running --no-pager --no-legend
+  echo; echo "== crontab"; crontab -l
+  echo; echo "== disk"; df -h /
+} >"$W/inventory.txt" 2>&1 || true
+if [[ $HAS_DOCKER == 1 ]]; then docker inspect $(docker ps -aq) >"$W/docker-inspect.json" 2>/dev/null || true; fi
+
+# ---------- 4. база Матрикса ----------
+if [[ -n "$VOL" ]]; then
+  say "4/5 база Матрикса: стоп Tuwunel на время копирования (остальное работает)"
+  T0=$SECONDS
+  docker stop -t 30 "$MATRIX" >/dev/null; STOPPED=1
+  tar -C "$VOL" -cf "$W/matrix-db.tar" .
+  docker start "$MATRIX" >/dev/null; STOPPED=0
+  say "   Матрикс снова запущен, простой $(( SECONDS - T0 )) сек"
+  if declare -F load_profile >/dev/null && ( load_profile ) >/dev/null 2>&1; then
+    load_profile; wait_matrix || say "   ⚠ Матрикс пока не ответил — проверь: nodus status"
+  fi
+  say "   сжимаю копию базы (Матрикс уже работает)..."
+  gzip -1 "$W/matrix-db.tar"
+else
+  say "4/5 базы Матрикса здесь нет — пропускаю"
+fi
+
+# ---------- 5. упаковка ----------
+say "5/5 упаковка"
+cat >"$W/README.txt" <<EOF
+Бэкап $HOST от $(date '+%F %T')
+
+configs.tar.gz           конфиги и ключи (пути — в configs-list.txt)
+container-data.tar.gz    данные контейнеров (что откуда — в container-mounts.txt)
+container-inside.tar.gz  папки изнутри контейнеров (если были в backup-paths.conf)
+matrix-db.tar.gz         база Tuwunel (том $MVOL)
+inventory.txt            как всё было: образы (с digest), порты, UFW, сервисы
+docker-inspect.json      полные параметры контейнеров
+
+Восстановление Matrix на новом сервере: setup.sh → «Восстановить из бэкапа».
+Свои личные пути (VPN и т.п.) — руками: tar -C / -xzf configs.tar.gz <путь>
+
+ВНИМАНИЕ: внутри приватные ключи, сертификаты, токены Матрикса. Не выкладывать и не пересылать.
+EOF
+(cd "$W" && sha256sum -- * >SHA256SUMS)
+F="$OUT/nodus-backup-$HOST-$TS.tar"
+tar -C "$W" -cf "$F" .
+sha256sum "$F" | awk '{print $1}' >"$F.sha256"
+chmod 600 "$F" "$F.sha256"
+
+# хранить последние $KEEP
+mapfile -t old < <(ls -1t "$OUT"/nodus-backup-"$HOST"-*.tar 2>/dev/null | tail -n +$(( KEEP + 1 )))
+for o in "${old[@]}"; do rm -f "$o" "$o.sha256"; done
+
+say "готово ✅  $F"
+say "   размер: $(du -h "$F" | cut -f1)   sha256: $(cat "$F.sha256")"
+tar -tvf "$F" | awk '{printf "     %8s  %s\n", $3, $6}'

@@ -1,0 +1,631 @@
+#!/usr/bin/env bash
+# =====================================================================
+#  nodus — помощник по управлению Matrix-сервером (звонки, секреты, бэкапы)
+# ---------------------------------------------------------------------
+#  nodus                — меню (статус сверху, выбираешь номер)
+#  nodus status         — статус
+#  nodus help           — все команды
+#  CHECK_ONLY=1 nodus <действие>  — только показать, что поменяется
+#
+#  Перед любым изменением: diff (секреты замазаны) → вопрос «да?» → бэкап
+#  конфигов → шаги с проверками → автооткат при ошибке. Секреты на экран не печатаются.
+#  Домен, IP и порт берутся из /opt/nodus/nodus.env, а если его нет — из конфигов.
+# =====================================================================
+set -Eeuo pipefail
+umask 077
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+NODUS_LIB="$(cd "$(dirname "$_self")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$NODUS_LIB/lib/common.sh"
+
+CHECK_ONLY="${CHECK_ONLY:-0}"
+STATE_ROOT="$BACKUP_ROOT/nodus-helper"
+CONTAINER_DIRS="nodus-rtc nodus-calls nodus-helper"
+DOCKER_NETS="172.16.0.0/12"   # docker-bridge сети: только им открываем 7880/8080
+
+declare -A LIVE=(
+  [compose]="$NODUS_DIR/docker-compose.yml"
+  [nginx]="$NODUS_DIR/nginx.conf"
+  [conduit]="$NODUS_DIR/conduit.toml"
+  [coturn]="$NODUS_DIR/coturn.conf"
+  [element]="$NODUS_DIR/element-config.json"
+  [lkyaml]="$RTC_DIR/livekit.yaml"
+  [lkcompose]="$RTC_DIR/docker-compose.yml"
+)
+ORDER=(lkyaml lkcompose coturn nginx conduit element compose)
+
+TMPD="$(mktemp -d)"; W=""
+APPLYING=0; BK=""; ACT=""; RTC_WAS_RUN=0; RTC_START=0; LK_RECREATE=0; RTC_CREATE=0; GW=""
+
+rtc_compose(){ dc -p nodus-rtc -f "${LIVE[lkcompose]}" "$@"; }
+
+py(){ # py live|work <операции...>
+  local base="$1"; shift; local k
+  local a=(DOMAIN="$DOMAIN" PUBLIC_IP="$PUBLIC_IP" GW="$GW" LK_IMAGE="$LK_IMAGE" JWT_IMAGE="$JWT_IMAGE")
+  for k in "${ORDER[@]}"; do
+    if [ "$base" = live ]; then a+=("P_$k=${LIVE[$k]}"); else a+=("P_$k=$W/$k"); fi
+  done
+  env "${a[@]}" python3 -I "$PYF" "$@"; }
+
+# ---------- откат ----------
+touched(){ [ -f "$BK/touched" ] && grep -qx "$1" "$BK/touched"; }
+rollback(){
+  set +e
+  step "АВТООТКАТ из $BK"
+  if [ -f "$BK/rtc-created" ]; then
+    rtc_compose down >/dev/null 2>&1; docker rm -f "$C_LK" "$C_JWT" >/dev/null 2>&1
+    rm -rf "$RTC_DIR"; ok "LiveKit/lk-jwt убраны, $RTC_DIR удалён (его не было до установки)"
+  fi
+  if [ -f "$BK/touched" ]; then
+    while read -r k; do
+      if [ -f "$BK/$k" ]; then cat "$BK/$k" > "${LIVE[$k]}" && ok "восстановлен ${LIVE[$k]}"
+      else rm -f "${LIVE[$k]}"; fi
+    done < <(sort -u "$BK/touched")
+  fi
+  if [ -f "$BK/ufw-added" ]; then
+    while read -r k; do
+      # shellcheck disable=SC2086
+      ufw delete $k >/dev/null 2>&1 && ok "ufw: удалено «$k»"
+    done < "$BK/ufw-added"
+  fi
+  touched coturn && { docker restart "$C_TURN" >/dev/null; ok "coturn перезапущен"; }
+  if touched nginx; then
+    if docker exec "$C_NGINX" nginx -t -q >/dev/null 2>&1; then docker exec "$C_NGINX" nginx -s reload >/dev/null 2>&1
+    else docker restart "$C_NGINX" >/dev/null; fi; ok "nginx перечитан"
+  fi
+  touched conduit && { docker restart "$C_MATRIX" >/dev/null; wait_matrix; ok "Tuwunel перезапущен"; }
+  if [ -f "${LIVE[lkcompose]}" ] && { touched lkyaml || touched lkcompose || [ "$RTC_START" = 1 ] || [ "$LK_RECREATE" = 1 ]; }; then
+    if [ "$RTC_WAS_RUN" = 1 ]; then rtc_compose up -d --force-recreate >/dev/null 2>&1; ok "LiveKit/lk-jwt пересозданы со старыми ключами"
+    else rtc_compose stop >/dev/null 2>&1; ok "LiveKit/lk-jwt остановлены, как было"; fi
+  fi
+  echo; ok "Откат завершён. Matrix: $(lcode /_matrix/client/versions)"
+}
+action_exit(){ local rc=$?
+  if [ "$APPLYING" = 1 ] && [ "$rc" -ne 0 ]; then APPLYING=0; rollback || true; fi; }
+trap 'rm -rf "$TMPD"' EXIT
+trap 'exit 130' INT TERM
+
+# ---------- состояние ----------
+human(){ case "$1" in on) echo "ВКЛ ✅";; off) echo "ВЫКЛ ⏸";; removed) echo "УДАЛЕНЫ 🗑";;
+  partial) echo "ЧАСТИЧНО ⚠";;
+  other) if [ "$NARROW" = 1 ]; then echo "НЕСТАНДАРТНО ⚠"; else echo "НЕСТАНДАРТНО ⚠ (не мой формат, трогать не буду)"; fi;;
+  *) echo "$1";; esac; }
+load_state(){
+  local s; s="$(py live state)" || die "не смог прочитать конфиги"
+  eval "$s"
+  RTC_DIR_OK=0; [ -f "${LIVE[lkcompose]}" ] && RTC_DIR_OK=1
+  RTC_RUN=0; running "$C_LK" && running "$C_JWT" && RTC_RUN=1
+  if [ $RTC_DIR_OK = 1 ] && [ $RTC_RUN = 1 ] && [ "$RTC_NGINX" = 1 ] && [ "$RTC_FOCI" = 1 ] && [ "$RTC_CONDUIT" = on ]; then RTC=on
+  elif [ $RTC_DIR_OK = 1 ] && [ $RTC_RUN = 0 ] && [ "$RTC_FOCI" = 0 ] && [ "$RTC_CONDUIT" != on ]; then RTC=off
+  elif [ $RTC_DIR_OK = 0 ] && [ "$RTC_NGINX" = 0 ] && [ "$RTC_FOCI" = 0 ] && [ "$RTC_CONDUIT" = none ]; then RTC=removed
+  else RTC=partial; fi
+}
+show_state(){
+  load_state
+  step "Сейчас"
+  if [ "${PROXY_MODE:-direct}" = behind ]; then echo "  Сервер: $DOMAIN (nginx за прокси, 127.0.0.1:$NGINX_PORT)" | wrapt
+  else echo "  Сервер: $DOMAIN" | wrapt; fi
+  if [ "$NARROW" = 1 ]; then echo "  Legacy: $(human "$LEGACY")"
+  else echo "  Legacy-звонки (классический Element):     $(human "$LEGACY")"; fi
+  case "$LEGACY_SYNC" in 1) ok "секрет Tuwunel ↔ coturn совпадает";; 0) warn "секрет Tuwunel ↔ coturn НЕ совпадает";; esac
+  if [ "$NARROW" = 1 ]; then echo "  Новые:  $(human "$RTC")"
+  else echo "  Новые звонки (Element X / Element Call):  $(human "$RTC")"; fi
+  case "$LK_TURN_SYNC" in 1) ok "TURN-секрет LiveKit ↔ coturn совпадает";; 0) warn "TURN-секрет LiveKit ↔ coturn НЕ совпадает";; esac
+  if [ "$RTC" = partial ]; then
+    { echo "     папка $RTC_DIR: $RTC_DIR_OK, контейнеры работают: $RTC_RUN, nginx-блок: $RTC_NGINX,"
+      echo "     rtc_foci в well-known: $RTC_FOCI, livekit_url в Tuwunel: $RTC_CONDUIT, Element Web exclusively: $RTC_ELEMENT"; } | wrapt
+  fi
+  [ "$CT_SEALED" = 1 ] && echo "  coturn: закрыт заглушкой (никому не выдаёт доступ)"
+  local last d
+  last="$(ls -1t "$BACKUP_ROOT"/nodus-backup-*.tar* 2>/dev/null | head -1 || true)"
+  if [ -n "$last" ]; then
+    d=$(( ( $(date +%s) - $(stat -c %Y "$last") ) / 86400 ))
+    if [ "$NARROW" = 1 ]; then echo "  Полный бэкап: $(date -d "@$(stat -c %Y "$last")" '+%d.%m %H:%M'), $d дн. назад"
+    else echo "  Последний полный бэкап: $(date -d "@$(stat -c %Y "$last")" '+%d.%m.%Y %H:%M') ($d дн. назад)"; fi
+    [ "$d" -ge 7 ] && warn "старше недели — может, сделать свежий (пункт 1)?"
+  else warn "полных бэкапов в $BACKUP_ROOT нет"; fi
+  return 0
+}
+
+# ---------- применение ----------
+changed(){ [ -f "$W/$1" ] && ! cmp -s "$W/$1" "${LIVE[$1]}"; }
+put(){ cat "$W/$1" > "${LIVE[$1]}"; echo "$1" >> "$BK/touched"; }
+nginx_apply(){
+  local out
+  docker cp "$W/nginx" "$C_NGINX:/etc/nginx/nodus-calls-test.conf" >/dev/null
+  out="$(docker exec "$C_NGINX" nginx -t -q -c /etc/nginx/nodus-calls-test.conf 2>&1)" \
+    || { docker exec "$C_NGINX" rm -f /etc/nginx/nodus-calls-test.conf; echo "$out" | grep -v http2; die "новый nginx.conf не прошёл nginx -t"; }
+  docker exec "$C_NGINX" rm -f /etc/nginx/nodus-calls-test.conf
+  put nginx
+  out="$(docker exec "$C_NGINX" nginx -t -q 2>&1)" || { echo "$out" | grep -v http2; die "живой nginx.conf не прошёл nginx -t"; }
+  docker exec "$C_NGINX" nginx -s reload >/dev/null 2>&1
+  sleep 2
+  [ "$(lcode /_matrix/client/versions)" = 200 ] || die "Matrix не отвечает после reload nginx"
+  ok "nginx перечитан без простоя, Matrix жив"
+}
+
+ufw_add(){ echo "$*" >> "$BK/ufw-added"; ufw "$@" comment 'nodus-rtc' >/dev/null; ok "ufw $*"; }
+rtc_install_checks(){
+  local p c
+  [ -n "$PUBLIC_IP" ] || die "не знаю публичный IP (нет в профиле и в coturn.conf external-ip)"
+  for p in 7880 7881 8080; do tcp_listen "$p" && die "TCP $p занят — LiveKit/lk-jwt туда не встанут"; done
+  if ss -Hlun 2>/dev/null | awk '{n=split($4,a,":"); x=a[n]+0; if(x>=50100 && x<=50200) f=1} END{exit !f}'; then
+    die "в UDP 50100-50200 уже что-то слушает"; fi
+  ufw status 2>/dev/null | grep -q '^Status: active' || die "UFW не активен — без него 7880/8080 будут торчать наружу"
+  GW="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$v.Gateway}} {{end}}' "$C_NGINX" 2>/dev/null | awk '{print $1}')"
+  [[ "$GW" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] || die "не понял шлюз docker-сети nginx (получил «$GW»)"
+  c="$(lcode '/_matrix/federation/v1/openid/userinfo?access_token=nodus-probe')"
+  case "$c" in 401|403) ok "openid/userinfo живой ($c) — lk-jwt сможет проверять пользователей";;
+    *) die "openid/userinfo вернул $c — без него lk-jwt не пустит в звонок";; esac
+  [ "$(pcode /_matrix/client/versions)" = 200 ] && ok "сервер видит сам себя по https://$DOMAIN" \
+    || warn "https://$DOMAIN с самого сервера не открылся — lk-jwt может не достучаться до Matrix (проверь DNS/прокси)"
+  return 0
+}
+
+run_action(){
+  ACT="$1"
+  trap action_exit EXIT; trap 'exit 130' INT TERM    # действие идёт в подоболочке
+  W="$(mktemp -d "$TMPD/w.XXXXXX")"
+  step "Действие: $ACT$([ "$CHECK_ONLY" = 1 ] && echo '  (CHECK_ONLY — только показать)')"
+  [ "$(lcode /_matrix/client/versions)" = 200 ] || die "Matrix сейчас не отвечает через nginx — сначала разберёмся с этим"
+  load_state
+  local k OPS=() RTC_STOP=0 RTC_REMOVE=0
+  RTC_START=0; LK_RECREATE=0
+  for k in "${ORDER[@]}"; do [ -f "${LIVE[$k]}" ] && cp "${LIVE[$k]}" "$W/$k"; done
+  need_lk(){ [ "$RTC_DIR_OK" = 1 ] && [ -f "${LIVE[lkyaml]}" ] || die "новых звонков нет ($RTC_DIR) — секретов LiveKit тоже нет"; }
+
+  case "$ACT" in
+    rotate-legacy)
+      [ "$LEGACY" = on ] || die "legacy-звонки сейчас $(human "$LEGACY") — менять нечего"
+      [ "$LEGACY_SYNC" = 1 ] || die "секрет в Tuwunel и coturn уже не совпадает — напиши мне, разрулим руками"
+      OPS=(legacy-rotate);;
+    rotate-lk-turn)
+      need_lk; [ "$LK_TURN_SYNC" = 1 ] || die "TURN-секрет LiveKit и coturn уже не совпадает — руками"
+      OPS=(lkturn-rotate); LK_RECREATE=1;;
+    rotate-lk-api) need_lk; OPS=(lkapi-rotate); LK_RECREATE=1;;
+    rotate-all)
+      if [ "$LEGACY" = on ]; then [ "$LEGACY_SYNC" = 1 ] || die "legacy-секрет не совпадает — руками"; OPS+=(legacy-rotate); fi
+      if [ "$RTC_DIR_OK" = 1 ] && [ -f "${LIVE[lkyaml]}" ]; then
+        [ "$LK_TURN_SYNC" = 1 ] || die "TURN-секрет LiveKit не совпадает — руками"
+        OPS+=(lkturn-rotate lkapi-rotate); LK_RECREATE=1; fi
+      [ ${#OPS[@]} -gt 0 ] || die "ни legacy, ни новых звонков нет — менять нечего";;
+    legacy-off)
+      case "$LEGACY" in on) OPS=(legacy-off);; off) die "legacy уже выключены";; removed) die "legacy уже удалены";; *) die "формат turn_* в conduit.toml нестандартный — руками";; esac;;
+    legacy-remove)
+      case "$LEGACY" in on|off) OPS=(legacy-remove);; removed) die "legacy уже удалены";; *) die "формат turn_* нестандартный — руками";; esac;;
+    legacy-on)
+      case "$LEGACY" in off|removed) OPS=(legacy-on);; on) die "legacy уже включены";; *) die "формат turn_* нестандартный — руками";; esac;;
+    rtc-off)
+      case "$RTC" in
+        on|partial) [ "$RTC_DIR_OK" = 1 ] || die "папки $RTC_DIR нет — тут поможет только «удалить» (rtc-remove)"; OPS=(rtc-off); RTC_STOP=1;;
+        off) die "новые звонки уже выключены";; removed) die "новые звонки уже удалены";; esac;;
+    rtc-remove)
+      [ "$RTC" = removed ] && die "новые звонки уже удалены"
+      OPS=(rtc-remove); RTC_REMOVE=1;;
+    rtc-on)
+      case "$RTC" in
+        off|partial) { [ "$RTC_DIR_OK" = 1 ] && [ "$RTC_NGINX" = 1 ]; } || die "установка неполная — сначала «удалить» (nodus rtc-remove), потом «nodus rtc-install»"
+                     OPS=(rtc-on); RTC_START=1;;
+        on) die "новые звонки уже включены";;
+        removed) die "новые звонки не установлены — поставить: nodus rtc-install";; esac;;
+    rtc-install)
+      [ "$RTC" = removed ] || die "новые звонки уже стоят (сейчас: $(human "$RTC")). Переставить: сначала nodus rtc-remove"
+      rtc_install_checks
+      OPS=(rtc-add); RTC_CREATE=1;;
+    *) die "неизвестное действие: $ACT";;
+  esac
+  [ "$RTC_RUN" = 1 ] || LK_RECREATE=0
+
+  py work "${OPS[@]}" || die "не смог собрать правки (причина выше). Ничего не менял."
+
+  step "Что поменяется (секреты замазаны)"
+  local any=0 add del
+  for k in "${ORDER[@]}"; do
+    changed "$k" || continue; any=1
+    if [ "$NARROW" = 1 ]; then
+      add=$(diff "${LIVE[$k]}" "$W/$k" | grep -c '^>' || true); del=$(diff "${LIVE[$k]}" "$W/$k" | grep -c '^<' || true)
+      echo "  ── ${LIVE[$k]##*/}: +$add −$del"
+      diff -u "${LIVE[$k]}" "$W/$k" | tail -n +3 | grep -E '^[+-]' | mask | sed 's/^/  /' | cutl || true
+    else
+      echo "  ---------- ${LIVE[$k]} ----------"
+      diff -u "${LIVE[$k]}" "$W/$k" | tail -n +3 | mask | sed 's/^/  /' || true
+    fi
+  done
+  if [ "$NARROW" = 1 ] && [ $any = 1 ] && [ "$YES" != 1 ]; then
+    echo "  (длинные строки обрезаны «…»)"
+    if ask "Показать целиком? да/нет:"; then
+      for k in "${ORDER[@]}"; do changed "$k" || continue
+        echo "  ---------- ${LIVE[$k]##*/} ----------"
+        diff -u "${LIVE[$k]}" "$W/$k" | tail -n +3 | mask | sed 's/^/  /' || true
+      done
+    fi
+  fi
+  [ $any = 1 ] || [ $RTC_STOP = 1 ] || [ $RTC_START = 1 ] || [ $RTC_REMOVE = 1 ] || [ $RTC_CREATE = 1 ] || die "менять нечего"
+
+  step "План"
+  {
+  [ $RTC_CREATE = 1 ] && echo "  • скачать образы, создать $RTC_DIR, запустить LiveKit и lk-jwt; UFW: 7880/8080 только из docker-сетей"
+  [ $RTC_START = 1 ]  && echo "  • запустить LiveKit и lk-jwt"
+  changed coturn      && echo "  • перезапуск coturn (идущие звонки через relay оборвутся)"
+  [ $LK_RECREATE = 1 ] && echo "  • пересоздать LiveKit и lk-jwt (идущие новые звонки оборвутся)"
+  changed nginx       && echo "  • nginx: nginx -t → reload (без простоя)"
+  changed conduit     && echo "  • перезапуск Tuwunel (Matrix недоступен несколько секунд)"
+  changed element     && echo "  • Element Web: новый config.json (обновить вкладку)"
+  [ $RTC_STOP = 1 ]   && echo "  • остановить LiveKit и lk-jwt (файлы и ключи остаются)"
+  [ $RTC_REMOVE = 1 ] && echo "  • удалить контейнеры LiveKit/lk-jwt, правила UFW nodus-rtc; $RTC_DIR → в бэкап"
+  echo "  • бэкап конфигов в $STATE_ROOT/<время>-$ACT/, при ошибке — автооткат"
+  } | wrapt
+
+  if [ "$CHECK_ONLY" = 1 ]; then echo; ok "CHECK_ONLY: ничего не менял."; exit 0; fi
+  echo
+  ask "Применяем? Напиши «да»:" || { ok "Ок, ничего не менял."; exit 0; }
+  if command -v nodus-backup >/dev/null && [ "$YES" != 1 ]; then
+    if ask "Ещё и полный nodus-backup? (Matrix ~3 сек) да/нет:"; then nodus-backup || die "nodus-backup упал — дальше не иду"; fi
+  fi
+
+  if [ $RTC_CREATE = 1 ]; then
+    step "Скачиваю образы LiveKit и lk-jwt"
+    docker pull -q "$LK_IMAGE" >/dev/null || die "не скачался $LK_IMAGE"
+    docker pull -q "$JWT_IMAGE" >/dev/null || die "не скачался $JWT_IMAGE"
+    ok "образы на месте"
+  fi
+
+  # ---- бэкап ----
+  BK="$STATE_ROOT/$(date +%Y%m%d-%H%M%S)-$ACT"; mkdir -p "$BK"
+  for k in "${ORDER[@]}"; do [ -f "${LIVE[$k]}" ] && cp -a "${LIVE[$k]}" "$BK/$k"; done
+  ufw status numbered > "$BK/ufw-before.txt" 2>/dev/null || true
+  ok "конфиги сохранены в $BK"
+  RTC_WAS_RUN=$RTC_RUN
+  APPLYING=1
+
+  if [ $RTC_CREATE = 1 ]; then
+    step "LiveKit + lk-jwt"
+    echo created > "$BK/rtc-created"
+    mkdir -p "$RTC_DIR"; chmod 700 "$RTC_DIR"
+    put lkyaml; put lkcompose
+    chmod 644 "${LIVE[lkyaml]}"; chmod 600 "${LIVE[lkcompose]}"   # yaml читает контейнер; чужих не пускает каталог 700
+    rtc_compose up -d >/dev/null 2>&1
+    wait_rtc || { show_logs "$C_LK"; show_logs "$C_JWT"; die "LiveKit/lk-jwt не поднялись"; }
+    ok "LiveKit :7880 и lk-jwt :8080 отвечают"
+    ufw_add allow from "$DOCKER_NETS" to any port 7880 proto tcp
+    ufw_add allow from "$DOCKER_NETS" to any port 8080 proto tcp
+  fi
+  if [ $RTC_START = 1 ]; then
+    step "Запускаю LiveKit и lk-jwt"
+    rtc_compose up -d >/dev/null 2>&1
+    wait_rtc || { show_logs "$C_LK"; show_logs "$C_JWT"; die "LiveKit/lk-jwt не поднялись"; }
+    ok "LiveKit :7880 и lk-jwt :8080 отвечают"
+  fi
+  if changed lkyaml || changed lkcompose; then
+    step "Ключи LiveKit"
+    changed lkyaml && put lkyaml
+    changed lkcompose && put lkcompose
+    ok "livekit.yaml / compose обновлены"
+  fi
+  if changed coturn; then
+    step "coturn"
+    put coturn; docker restart "$C_TURN" >/dev/null
+    wait_coturn || { show_logs "$C_TURN"; die "coturn не поднялся"; }
+    ok "coturn снова слушает 3478 и 5349"
+  fi
+  if [ $LK_RECREATE = 1 ]; then
+    step "Пересоздаю LiveKit и lk-jwt"
+    rtc_compose up -d --force-recreate >/dev/null 2>&1
+    wait_rtc || { show_logs "$C_LK"; show_logs "$C_JWT"; die "LiveKit/lk-jwt не поднялись с новыми ключами"; }
+    ok "LiveKit и lk-jwt работают с новыми ключами"
+  fi
+  if changed nginx; then step "nginx"; nginx_apply; fi
+  if changed conduit; then
+    step "Tuwunel"
+    put conduit; docker restart "$C_MATRIX" >/dev/null
+    wait_matrix || { show_logs "$C_MATRIX"; die "Tuwunel не поднялся"; }
+    ok "Tuwunel поднялся"
+  fi
+  if changed element; then
+    step "Element Web"; put element
+    [ "$(lcode /config.json)" = 200 ] && ok "config.json отдаётся" || warn "не проверил /config.json — глянь Element Web глазами"
+  fi
+
+  # ---- проверки ----
+  step "Проверки"
+  [ "$(lcode /_matrix/client/versions)" = 200 ] || die "Matrix не отвечает"; ok "Matrix отвечает"
+  lbody /.well-known/matrix/client | grep -q '"m.homeserver"' || die "well-known сломан"; ok "well-known отдаётся"
+  load_state
+  case "$ACT" in
+    rotate-legacy) [ "$LEGACY_SYNC" = 1 ] || die "секреты Tuwunel/coturn не совпали";;
+    rotate-lk-turn) [ "$LK_TURN_SYNC" = 1 ] || die "TURN-секреты LiveKit/coturn не совпали";;
+    rotate-all) { [ "$LEGACY" != on ] || [ "$LEGACY_SYNC" = 1 ]; } && [ "$LK_TURN_SYNC" != 0 ] || die "секреты не совпали";;
+    legacy-off) [ "$LEGACY" = off ] || die "legacy не выключились";;
+    legacy-remove) [ "$LEGACY" = removed ] || die "legacy не удалились";;
+    legacy-on) [ "$LEGACY" = on ] && [ "$LEGACY_SYNC" = 1 ] || die "legacy не включились";;
+    rtc-on|rtc-install) [ "$RTC" = on ] || die "новые звонки не включились полностью";;
+    rtc-off|rtc-remove) [ "$RTC_FOCI" = 0 ] && [ "$RTC_CONDUIT" != on ] || die "rtc_foci/livekit_url не убрались";;
+  esac
+  ok "секреты и состояние как надо"
+  if [ "$RTC_RUN" = 1 ] && [ "$RTC_NGINX" = 1 ]; then
+    [ "$(lcode /livekit/jwt/healthz)" = 200 ] || die "/livekit/jwt/healthz через nginx не 200"
+    ok "/livekit/jwt/healthz → 200"
+  fi
+  APPLYING=0
+  echo done > "$BK/status"
+
+  # ---- необратимое, только после успешных проверок ----
+  if [ $RTC_STOP = 1 ]; then
+    step "Останавливаю LiveKit и lk-jwt"
+    rtc_compose stop >/dev/null 2>&1 && ok "остановлены (после перезагрузки сервера сами не стартуют)"
+  fi
+  if [ $RTC_REMOVE = 1 ]; then
+    step "Удаляю LiveKit и lk-jwt"
+    [ -f "${LIVE[lkcompose]}" ] && rtc_compose down >/dev/null 2>&1 || true
+    docker rm -f "$C_LK" "$C_JWT" >/dev/null 2>&1 || true
+    ok "контейнеры удалены"
+    if [ -d "$RTC_DIR" ]; then mv "$RTC_DIR" "$BK/nodus-rtc-dir"; ok "$RTC_DIR перенесён в $BK/nodus-rtc-dir"; fi
+    local nums=() n
+    mapfile -t nums < <(ufw status numbered | sed -n 's/^\[ *\([0-9]\+\)\].*# nodus-rtc.*/\1/p' | sort -rn)
+    for n in "${nums[@]}"; do ufw --force delete "$n" >/dev/null && ok "ufw: удалено правило №$n (nodus-rtc)"; done
+    echo "  Образы LiveKit/lk-jwt занимают место; при переустановке скачаются заново." | wrapt
+    if ask "Удалить образы? да/нет:"; then
+      # shellcheck disable=SC2086
+      docker image rm "$LK_IMAGE" "$JWT_IMAGE" >/dev/null 2>&1 && ok "образы удалены" || warn "образы не удалились (не страшно)"
+    fi
+  fi
+
+  echo; ok "ГОТОВО: $ACT. Бэкап: $BK"
+  { case "$ACT" in
+    rotate-legacy|rotate-all) echo "  Классический Element: если legacy-звонок не пройдёт — перезапусти приложение (у него кэш TURN-логина ~сутки).";;
+    legacy-on) echo "  Классический Element: перезапусти приложения, чтобы они взяли свежий TURN-логин.";;
+    rtc-off|rtc-remove) echo "  Element X: кнопка звонка может пропасть не сразу — перезапусти приложение.";;
+    rtc-install) [ "$(pcode /livekit/jwt/healthz)" = 200 ] || echo "  ⚠ снаружи https://$DOMAIN/livekit/jwt/healthz не ответил 200 — проверь с телефона."
+                 echo "  Дальше: звонок Element X ↔ Element X. Медиа идёт через coturn TLS 5349.";;
+  esac; } | wrapt
+  show_state
+}
+
+# ---------- бэкапы ----------
+collect_backups(){
+  BK_LIST=(); local p sub base lines=()
+  shopt -s nullglob
+  for p in "$BACKUP_ROOT"/*; do
+    [ -L "$p" ] && continue; base="${p##*/}"
+    if [ -d "$p" ] && [[ " $CONTAINER_DIRS " == *" $base "* ]]; then
+      for sub in "$p"/*; do [ -L "$sub" ] && continue; lines+=("$(stat -c %Y "$sub") $sub"); done
+    else lines+=("$(stat -c %Y "$p") $p"); fi
+  done
+  shopt -u nullglob
+  [ ${#lines[@]} -gt 0 ] || return 0
+  mapfile -t BK_LIST < <(printf '%s\n' "${lines[@]}" | sort -rn | cut -d' ' -f2-)
+}
+bk_kind(){
+  local base="${1##*/}" parent a; parent="$(basename "$(dirname "$1")")"
+  case "$base" in
+    nodus-backup-*.tar|nodus-backup-*.tar.gz|nodus-backup-*.tgz) echo "полный"; return;;
+    nodus-backup-*) echo "к полному бэкапу"; return;;
+  esac
+  case "$parent" in
+    nodus-rtc) echo "конфиги перед установкой звонков";;
+    nodus-calls|nodus-helper)
+      a="${base#????????-??????}"; a="${a#-}"
+      if [ "$a" = manual ]; then echo "конфиги (вручную)"; else echo "конфиги перед: ${a:-?}"; fi;;
+    *) echo "другое";;
+  esac
+}
+bk_short(){ local k a; k="$(bk_kind "$1")"
+  case "$k" in
+    полный) echo "ПОЛНЫЙ";;
+    "конфиги перед установкой звонков") echo "конф: установка";;
+    "конфиги (вручную)") echo "конф: вручную";;
+    "конфиги перед: "*) a="${k#конфиги перед: }"
+      case "$a" in
+        rotate-legacy) a="смена legacy";; rotate-lk-turn) a="смена LK-TURN";; rotate-lk-api) a="смена LK-API";;
+        rotate-all) a="смена всех";; legacy-off) a="legacy выкл";; legacy-remove) a="legacy удал";;
+        legacy-on) a="legacy вкл";; rtc-off) a="новые выкл";; rtc-remove) a="новые удал";; rtc-on) a="новые вкл";;
+      esac; echo "конф: $a";;
+    *) echo "$k";;
+  esac; }
+bk_date(){ if [ "$NARROW" = 1 ]; then date -d "@$(stat -c %Y "$1")" '+%d.%m %H:%M'; else date -d "@$(stat -c %Y "$1")" '+%d.%m.%Y %H:%M'; fi; }
+bk_size(){ du -sh "$1" 2>/dev/null | cut -f1; }
+show_backups(){
+  collect_backups
+  step "Бэкапы (свежие сверху)"
+  if [ ${#BK_LIST[@]} -eq 0 ]; then echo "  пусто"; return 0; fi
+  local i=0 p free
+  for p in "${BK_LIST[@]}"; do i=$((i+1))
+    if [ "$NARROW" = 1 ]; then
+      printf '  %2d) %s %5s %s\n' "$i" "$(bk_date "$p")" "$(bk_size "$p")" "$(bk_short "$p")" | cutl
+    else
+      printf '  %2d) %s  %6s  %s\n' "$i" "$(bk_date "$p")" "$(bk_size "$p")" "$(bk_kind "$p")"
+      printf '      %s\n' "$p"
+    fi
+  done
+  free="$(df -h --output=avail /root | tail -1 | tr -d ' ')"
+  echo
+  if [ "$NARROW" = 1 ]; then echo "  Занято: $(du -sh "$BACKUP_ROOT" | cut -f1), свободно: $free"
+  else
+    echo "  Всего занято: $(du -sh "$BACKUP_ROOT" | cut -f1), свободно на диске: $free"
+    echo "  Скачать на Mac: SFTP в Termius → путь из списка."
+  fi
+}
+backup_paths(){ # на узком экране пути не влезают — показываем по номеру
+  [ "$NARROW" = 1 ] && [ ${#BK_LIST[@]} -gt 0 ] || return 0
+  local n p
+  while true; do
+    read -r -p "  Номер — путь для SFTP (Enter — назад): " n </dev/tty || return 0
+    [ -n "$n" ] || return 0
+    if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le ${#BK_LIST[@]} ]; then
+      p="${BK_LIST[$((n-1))]}"; echo "  папка: ${p%/*}/"; echo "  файл:  ${p##*/}"
+    else warn "нет такого номера"; fi
+  done
+}
+backup_full(){
+  command -v nodus-backup >/dev/null || die "нет nodus-backup"
+  step "Полный бэкап (nodus-backup)"
+  echo "  Matrix остановится на ~3 сек, остальное (VPN, RustDesk, coturn) работает."
+  ask "Делаем? (да/нет):" || { ok "Ок, не делаю."; return 0; }
+  nodus-backup || die "nodus-backup упал"
+  ok "Готово. Не забудь скачать свежий бэкап на Mac."
+}
+backup_configs(){
+  step "Бэкап конфигов (без простоя)"
+  local d k; d="$STATE_ROOT/$(date +%Y%m%d-%H%M%S)-manual"; mkdir -p "$d"
+  for k in "${ORDER[@]}"; do [ -f "${LIVE[$k]}" ] && cp -a "${LIVE[$k]}" "$d/$k"; done
+  ufw status numbered > "$d/ufw.txt" 2>/dev/null || true
+  ( cd "$d" && sha256sum -- * > SHA256SUMS )
+  ok "сохранено ($(du -sh "$d" | cut -f1)):"
+  echo "  папка: ${d%/*}/"; echo "  имя:   ${d##*/}"
+  warn "внутри секреты — никому не пересылай"
+}
+delete_backups(){
+  show_backups
+  [ ${#BK_LIST[@]} -gt 0 ] || return 0
+  if [ "$NARROW" = 1 ]; then cat <<'EOF'
+
+  Номера: 3 5 7  или  4-9
+  «оставить 3» — удалить
+    полные, кроме 3 свежих
+  Enter — отмена
+EOF
+  else cat <<'EOF'
+
+  Как выбрать:
+    номера через пробел:  3 5 7       диапазон:  4-9
+    «оставить 3» — удалить все ПОЛНЫЕ бэкапы, кроме трёх самых свежих (конфиги не трогает)
+    пусто — ничего не удалять
+EOF
+  fi
+  local sel n=${#BK_LIST[@]} t a b i p newest="" pick=() cnt=0 keep fulls=0
+  read -r -p "  Что удалить? " sel </dev/tty || return 0
+  [ -n "$sel" ] || { ok "Ок, ничего не удаляю."; return 0; }
+  if [[ "$sel" =~ ^(оставить|keep|k)[[:space:]]+([0-9]+)$ ]]; then
+    keep=${BASH_REMATCH[2]}
+    for p in "${BK_LIST[@]}"; do
+      [ "$(bk_kind "$p")" = полный ] || continue
+      cnt=$((cnt+1)); [ "$cnt" -gt "$keep" ] && pick+=("$p")
+    done
+  else
+    for t in $sel; do
+      if [[ $t =~ ^[0-9]+$ ]]; then a=$t; b=$t
+      elif [[ $t =~ ^([0-9]+)-([0-9]+)$ ]]; then a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+      else die "не понял «$t»"; fi
+      { [ "$a" -ge 1 ] && [ "$b" -le "$n" ] && [ "$a" -le "$b" ]; } || die "номера должны быть от 1 до $n"
+      for i in $(seq "$a" "$b"); do pick+=("${BK_LIST[$((i-1))]}"); done
+    done
+  fi
+  [ ${#pick[@]} -gt 0 ] || { ok "Удалять нечего."; return 0; }
+  mapfile -t pick < <(printf '%s\n' "${pick[@]}" | awk '!s[$0]++')
+  for p in "${BK_LIST[@]}"; do [ "$(bk_kind "$p")" = полный ] && { [ -z "$newest" ] && newest="$p"; fulls=$((fulls+1)); }; done
+  step "Будет удалено"
+  cnt=0
+  for p in "${pick[@]}"; do
+    if [ "$NARROW" = 1 ]; then printf '  • %s %s %s\n' "$(bk_date "$p")" "$(bk_size "$p")" "$(bk_short "$p")" | cutl
+    else printf '  • %s  (%s, %s)\n' "$p" "$(bk_kind "$p")" "$(bk_size "$p")"; fi
+    [ "$p" = "$newest" ] && warn "это САМЫЙ СВЕЖИЙ полный бэкап"
+    [ "$(bk_kind "$p")" = полный ] && cnt=$((cnt+1))
+  done
+  [ "$fulls" -gt 0 ] && [ "$cnt" -ge "$fulls" ] && warn "на сервере не останется НИ ОДНОГО полного бэкапа (на Mac копии есть?)"
+  ask "Удаляем насовсем? Напиши «да»:" || { ok "Ок, ничего не удаляю."; return 0; }
+  for p in "${pick[@]}"; do
+    case "$p" in "$BACKUP_ROOT"/*) ;; *) warn "пропускаю странный путь $p"; continue;; esac
+    [[ "$p" == *..* ]] && { warn "пропускаю $p"; continue; }
+    [ -e "$p" ] || continue
+    rm -rf --one-file-system -- "$p" && ok "удалено $p"
+  done
+  [ -L "$BACKUP_ROOT/nodus-rtc/latest" ] && [ ! -e "$BACKUP_ROOT/nodus-rtc/latest" ] && rm -f "$BACKUP_ROOT/nodus-rtc/latest"
+  for t in $CONTAINER_DIRS; do rmdir "$BACKUP_ROOT/$t" 2>/dev/null || true; done
+  ok "Свободно на диске: $(df -h --output=avail /root | tail -1 | tr -d ' ')"
+}
+
+# ---------- меню ----------
+usage(){ cat <<'EOF'
+  nodus                  меню
+  nodus status           статус
+  Бэкапы:        backup | backup-configs | backups | backups-delete
+  Секреты:       rotate-legacy | rotate-lk-turn | rotate-lk-api | rotate-all
+  Legacy-звонки: legacy-off | legacy-remove | legacy-on
+  Новые звонки:  rtc-off | rtc-remove | rtc-on | rtc-install
+  CHECK_ONLY=1 nodus <действие>   — только показать изменения, ничего не трогать
+EOF
+}
+dispatch(){
+  case "$1" in
+    backup) backup_full;; backup-configs) backup_configs;; backups) show_backups; backup_paths;; backups-delete) delete_backups;;
+    *) run_action "$1";;
+  esac
+}
+menu(){
+  local c x act
+  while true; do
+    detect_width
+    show_state
+    if [ "$NARROW" = 1 ]; then cat <<'EOF'
+
+ Бэкапы
+   1 полный   2 конфиги
+   3 список   4 удалить
+ Секреты
+   5 legacy   6 LK-TURN
+   7 LK-API   8 все
+ Legacy-звонки
+   9 выкл 10 удал 11 вкл
+ Новые звонки
+  12 выкл 13 удал 14 вкл
+
+   0 выход    ? пояснения
+EOF
+    else menu_full; fi
+    read -r -p "  Что делаем? " c </dev/tty || exit 0
+    case "$c" in
+      "?") menu_full | wrapt; read -r -p "  Enter — назад: " x </dev/tty || exit 0; continue;;
+    esac
+    case "$c" in
+      1) act=backup;; 2) act=backup-configs;; 3) act=backups;; 4) act=backups-delete;;
+      5) act=rotate-legacy;; 6) act=rotate-lk-turn;; 7) act=rotate-lk-api;; 8) act=rotate-all;;
+      9) act=legacy-off;; 10) act=legacy-remove;; 11) act=legacy-on;;
+      12) act=rtc-off;; 13) act=rtc-remove;; 14) act=rtc-on; [ "$RTC" = removed ] && act=rtc-install;;
+      0|q|"") ok "Пока 👋"; exit 0;;
+      *) warn "нет такого пункта: $c"; continue;;
+    esac
+    ( dispatch "$act" ) || true
+    echo
+    read -r -p "  Enter — меню, 0 — выход: " x </dev/tty || exit 0
+    [ "$x" = 0 ] && { ok "Пока 👋"; exit 0; }
+  done
+}
+menu_full(){ cat <<'EOF'
+
+  Бэкапы
+     1) полный бэкап (nodus-backup, Matrix встанет на ~3 сек)
+     2) бэкап только конфигов (сразу, без простоя)
+     3) посмотреть бэкапы
+     4) удалить бэкапы
+  Секреты
+     5) сменить секрет legacy TURN     (Tuwunel ↔ coturn)
+     6) сменить TURN-секрет LiveKit    (LiveKit ↔ coturn)
+     7) сменить API-ключ LiveKit       (LiveKit ↔ lk-jwt)
+     8) сменить все, какие есть
+  Legacy-звонки (классический Element)
+     9) выключить    10) удалить    11) включить
+  Новые звонки (Element X / Element Call)
+    12) выключить    13) удалить    14) включить (если удалены — поставит заново)
+  ---
+     0) выход
+  (Выключить = файлы остаются, включается обратно за минуту.
+   Удалить = настройки стираются; для новых звонков — и контейнеры. Бэкап конфигов остаётся.)
+EOF
+}
+
+# ---------- старт ----------
+detect_width
+[ "$(id -u)" = 0 ] || die "запусти от root"
+for c in docker python3 curl ufw ss diff cmp; do command -v "$c" >/dev/null || die "нет команды $c"; done
+python3 -c 'import tomllib' 2>/dev/null || die "нужен python3 3.11+"
+for k in nginx conduit coturn element; do [ -f "${LIVE[$k]}" ] || die "нет ${LIVE[$k]} — сервер ставится через setup.sh"; done
+load_profile
+load_versions
+
+case "${1:-menu}" in
+  menu) menu;;
+  status) show_state;;
+  help|-h|--help) usage | wrapt;;
+  *) ( dispatch "$1" );;
+esac
