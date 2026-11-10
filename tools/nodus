@@ -535,83 +535,125 @@ EOF
   ok "Свободно на диске: $(df -h --output=avail /root | tail -1 | tr -d ' ')"
 }
 
+# ---------- диагностика и обслуживание ----------
+# shellcheck source=../lib/diag.sh
+. "$NODUS_LIB/lib/diag.sh"
+# shellcheck source=../lib/ops.sh
+. "$NODUS_LIB/lib/ops.sh"
+
 # ---------- меню ----------
 usage(){ cat <<'EOF'
-  nodus                  меню
-  nodus status           статус
-  Бэкапы:        backup | backup-configs | backups | backups-delete
-  Секреты:       rotate-legacy | rotate-lk-turn | rotate-lk-api | rotate-all
-  Legacy-звонки: legacy-off | legacy-remove | legacy-on
-  Новые звонки:  rtc-off | rtc-remove | rtc-on | rtc-install
-  CHECK_ONLY=1 nodus <действие>   — только показать изменения, ничего не трогать
+  nodus                    меню
+  nodus status             короткий статус
+  nodus check              полная проверка
+  nodus logs | services | turn-test | report
+  Бэкапы:      backup | backup-configs | backups | backups-delete | backup-schedule
+  Обновления:  update | self-update
+  Сертификат:  cert | cert-dry-run | cert-renew
+  Секреты:     rotate-legacy | rotate-lk-turn | rotate-lk-api | rotate-all
+  Старые звонки:  legacy-off | legacy-remove | legacy-on
+  Новые звонки:   rtc-off | rtc-remove | rtc-on | rtc-install
+  CHECK_ONLY=1 nodus <действие>   — только показать изменения
 EOF
 }
 dispatch(){
   case "$1" in
+    status) quick_status;;
+    check) do_check;; logs) do_logs;; services) do_services;; turn-test) do_turn_test;; report) do_report;;
     backup) backup_full;; backup-configs) backup_configs;; backups) show_backups; backup_paths;; backups-delete) delete_backups;;
+    backup-schedule) do_backup_schedule;;
+    update) do_update_images;; self-update) do_self_update;;
+    cert) step "Сертификат"; cert_status;; cert-dry-run) do_cert_dry_run;; cert-renew) do_cert_renew;;
+    rtc-on-or-install) load_state; if [ "$RTC" = removed ]; then run_action rtc-install; else run_action rtc-on; fi;;
     *) run_action "$1";;
   esac
 }
-menu(){
-  local c x act
+pause(){ echo; local x; read -r -p "  Enter — назад: " x </dev/tty || exit 0; }
+run_sub(){ # действие в подоболочке: ошибка или Ctrl+C возвращают в меню, а не закрывают nodus
+  trap 'true' INT; ( dispatch "$1" ) || true; trap 'exit 130' INT TERM
+}
+submenu(){ # submenu <заголовок> <функция статуса или -> "<пункт>|<действие>" ...
+  local title="$1" sfn="$2"; shift 2
+  local items=("$@") c i
   while true; do
     detect_width
-    show_state
-    if [ "$NARROW" = 1 ]; then cat <<'EOF'
-
- Бэкапы
-   1 полный   2 конфиги
-   3 список   4 удалить
- Секреты
-   5 legacy   6 LK-TURN
-   7 LK-API   8 все
- Legacy-звонки
-   9 выкл 10 удал 11 вкл
- Новые звонки
-  12 выкл 13 удал 14 вкл
-
-   0 выход    ? пояснения
-EOF
-    else menu_full; fi
-    read -r -p "  Что делаем? " c </dev/tty || exit 0
-    case "$c" in
-      "?") menu_full | wrapt; read -r -p "  Enter — назад: " x </dev/tty || exit 0; continue;;
-    esac
-    case "$c" in
-      1) act=backup;; 2) act=backup-configs;; 3) act=backups;; 4) act=backups-delete;;
-      5) act=rotate-legacy;; 6) act=rotate-lk-turn;; 7) act=rotate-lk-api;; 8) act=rotate-all;;
-      9) act=legacy-off;; 10) act=legacy-remove;; 11) act=legacy-on;;
-      12) act=rtc-off;; 13) act=rtc-remove;; 14) act=rtc-on; [ "$RTC" = removed ] && act=rtc-install;;
-      0|q|"") ok "Пока 👋"; exit 0;;
-      *) warn "нет такого пункта: $c"; continue;;
-    esac
-    ( dispatch "$act" ) || true
+    step "$title"
+    if [ "$sfn" != - ]; then $sfn || true; fi
     echo
-    read -r -p "  Enter — меню, 0 — выход: " x </dev/tty || exit 0
-    [ "$x" = 0 ] && { ok "Пока 👋"; exit 0; }
+    for i in "${!items[@]}"; do printf '   %d) %s\n' $((i+1)) "${items[$i]%%|*}"; done | wrapt
+    echo "   0) назад"
+    read -r -p "  Выбор: " c </dev/tty || return 0
+    case "$c" in 0|"") return 0;; esac
+    if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le ${#items[@]} ]; then
+      run_sub "${items[$((c-1))]#*|}"; pause
+    else warn "нет такого пункта"; fi
   done
 }
-menu_full(){ cat <<'EOF'
-
-  Бэкапы
-     1) полный бэкап (nodus-backup, Matrix встанет на ~3 сек)
-     2) бэкап только конфигов (сразу, без простоя)
-     3) посмотреть бэкапы
-     4) удалить бэкапы
-  Секреты
-     5) сменить секрет legacy TURN     (Tuwunel ↔ coturn)
-     6) сменить TURN-секрет LiveKit    (LiveKit ↔ coturn)
-     7) сменить API-ключ LiveKit       (LiveKit ↔ lk-jwt)
-     8) сменить все, какие есть
-  Legacy-звонки (классический Element)
-     9) выключить    10) удалить    11) включить
-  Новые звонки (Element X / Element Call)
-    12) выключить    13) удалить    14) включить (если удалены — поставит заново)
-  ---
-     0) выход
-  (Выключить = файлы остаются, включается обратно за минуту.
-   Удалить = настройки стираются; для новых звонков — и контейнеры. Бэкап конфигов остаётся.)
+st_backups(){ local f d; f="$(last_backup)"
+  if [ -n "$f" ]; then d="$(backup_days)"; echo "  Последний полный: $(bk_date "$f"), $d дн. назад"; else warn "полных бэкапов нет"; fi
+  backup_schedule_status; }
+st_updates(){ echo "  nodus: $(cat "$NODUS_LIB/REF" 2>/dev/null || echo из чата/вручную)"
+  [ -f "$NODUS_DIR/versions.lock" ] && echo "  Рабочие версии записаны: $(stat -c %y "$NODUS_DIR/versions.lock" | cut -d. -f1)"; return 0; }
+st_calls(){
+  load_state
+  echo "  Старые (классический Element):     $(human "$LEGACY")" | wrapt
+  case "$LEGACY_SYNC" in 1) ok "секрет Tuwunel ↔ coturn совпадает";; 0) warn "секрет Tuwunel ↔ coturn НЕ совпадает";; esac
+  echo "  Новые (Element X / Element Call):  $(human "$RTC")" | wrapt
+  case "$LK_TURN_SYNC" in 1) ok "TURN-секрет LiveKit ↔ coturn совпадает";; 0) warn "TURN-секрет LiveKit ↔ coturn НЕ совпадает";; esac
+  echo "  (выключить — файлы остаются; удалить — настройки стираются, у новых и контейнеры)" | wrapt
+}
+menu_advanced(){
+  local c
+  while true; do
+    detect_width
+    step "Расширенные"
+    cat <<'EOF'
+   1) Бэкапы
+   2) Обновления
+   3) Сертификат
+   4) Секреты
+   5) Звонки
+   0) назад
 EOF
+    read -r -p "  Выбор: " c </dev/tty || return 0
+    case "$c" in
+      1) submenu "Бэкапы" st_backups "полный бэкап (Matrix встанет на ~3 сек)|backup" "только конфиги (без простоя)|backup-configs" \
+           "список|backups" "удалить|backups-delete" "автобэкап по расписанию|backup-schedule";;
+      2) submenu "Обновления" st_updates "образы контейнеров (с откатом)|update" "сам nodus из репо|self-update";;
+      3) submenu "Сертификат" cert_status "пробное продление (проверить хуки)|cert-dry-run" "продлить сейчас|cert-renew";;
+      4) submenu "Секреты" - "секрет старых звонков (Tuwunel ↔ coturn)|rotate-legacy" "TURN-секрет LiveKit (LiveKit ↔ coturn)|rotate-lk-turn" \
+           "API-ключ LiveKit (LiveKit ↔ lk-jwt)|rotate-lk-api" "все, какие есть|rotate-all";;
+      5) submenu "Звонки" st_calls "старые: выключить|legacy-off" "старые: удалить|legacy-remove" "старые: включить|legacy-on" \
+           "новые: выключить|rtc-off" "новые: удалить|rtc-remove" "новые: включить (если удалены — поставить)|rtc-on-or-install";;
+      0|"") return 0;;
+      *) warn "нет такого пункта";;
+    esac
+  done
+}
+menu(){
+  local c
+  while true; do
+    detect_width
+    quick_status
+    cat <<'EOF'
+
+   1) Проверка (всё сразу)
+   2) Логи
+   3) Сервисы
+   4) Тест TURN
+   5) Отчёт для Claude
+   6) Расширенные →
+   0) Выход
+EOF
+    read -r -p "  Что делаем? " c </dev/tty || exit 0
+    case "$c" in
+      1) run_sub check; pause;; 2) run_sub logs; pause;; 3) run_sub services; pause;;
+      4) run_sub turn-test; pause;; 5) run_sub report; pause;;
+      6) menu_advanced;;
+      0|q|"") ok "Пока 👋"; exit 0;;
+      *) warn "нет такого пункта: $c";;
+    esac
+  done
 }
 
 # ---------- старт ----------
@@ -625,7 +667,6 @@ load_versions
 
 case "${1:-menu}" in
   menu) menu;;
-  status) show_state;;
   help|-h|--help) usage | wrapt;;
   *) ( dispatch "$1" );;
 esac
