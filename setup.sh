@@ -167,7 +167,9 @@ install_tools(){
   rm -rf "$INSTALL_LIB"; mv "$INSTALL_LIB.new" "$INSTALL_LIB"
   chmod 755 "$INSTALL_LIB/tools/"*
   ln -sfn "$INSTALL_LIB/tools/nodus" /usr/local/sbin/nodus
-  ln -sfn "$INSTALL_LIB/tools/nodus-backup" /usr/local/sbin/nodus-backup
+  if [ -e /usr/local/sbin/nodus-backup ] && [ ! -L /usr/local/sbin/nodus-backup ]; then
+    warn "оставил твой /usr/local/sbin/nodus-backup как есть (версия из репо: $INSTALL_LIB/tools/nodus-backup)"
+  else ln -sfn "$INSTALL_LIB/tools/nodus-backup" /usr/local/sbin/nodus-backup; fi
   mkdir -p /etc/nodus
   [ -f /etc/nodus/backup-paths.conf ] || cat > /etc/nodus/backup-paths.conf <<'EOF'
 # Свои пути для nodus-backup (по строке, относительно /). Примеры:
@@ -475,14 +477,13 @@ do_tools(){ # поставить/обновить nodus и nodus-backup на у�
   [ -f "$NODUS_DIR/conduit.toml" ] || die "здесь нет $NODUS_DIR — сначала установка (setup.sh --install)"
   NODUS_LIB="$SRC"; PYF="$SRC/lib/edit.py"; load_profile
   local st legacy rtc old=""
-  [ -f /usr/local/sbin/nodus-backup ] && [ ! -L /usr/local/sbin/nodus-backup ] && old=/usr/local/sbin/nodus-backup.old-$(date +%Y%m%d)
+  [ -f /usr/local/sbin/nodus-backup ] && [ ! -L /usr/local/sbin/nodus-backup ] && old=keep
   { echo "  • поставить nodus и nodus-backup из $NODUS_REPO@$NODUS_REF в $INSTALL_LIB"
-    [ -n "$old" ] && echo "  • твой текущий nodus-backup сохранить как $old"
+    [ -n "$old" ] && echo "  • твой nodus-backup НЕ трогаю (версия из репо будет лежать рядом в $INSTALL_LIB)"
     [ -f "$PROFILE" ] || echo "  • создать профиль $PROFILE из текущих конфигов (домен $DOMAIN)"
     echo "  • конфиги и контейнеры НЕ трогаю"; } | wrapt
   if [ "$CHECK" = 1 ]; then echo; ok "--check: ничего не менял."; return 0; fi
   ask "Ставим? да/нет:" || { ok "Ок, ничего не делаю."; return 0; }
-  [ -n "$old" ] && cp -a /usr/local/sbin/nodus-backup "$old" && rm -f /usr/local/sbin/nodus-backup
   install_tools
   if [ ! -f "$PROFILE" ]; then
     st="$(env DOMAIN="$DOMAIN" P_conduit="$NODUS_DIR/conduit.toml" P_coturn="$NODUS_DIR/coturn.conf" \
@@ -493,8 +494,8 @@ do_tools(){ # поставить/обновить nodus и nodus-backup на у�
     write_profile; ok "профиль создан: $PROFILE"
   fi
   if [ -n "$old" ]; then
-    { echo; echo "  ⚠ Новый nodus-backup берёт только Matrix-часть. Свои пути (VPN, Xray и т.п.)"
-      echo "    впиши в /etc/nodus/backup-paths.conf — по строке на путь. Старый скрипт: $old"; } | wrapt
+    { echo; echo "  Перейти на nodus-backup из репо: впиши свои пути в /etc/nodus/backup-paths.conf,"
+      echo "  потом: ln -sfn $INSTALL_LIB/tools/nodus-backup /usr/local/sbin/nodus-backup"; } | wrapt
   fi
   ok "готово — проверь: nodus status"
 }
